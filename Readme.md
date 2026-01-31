@@ -12,7 +12,7 @@ PARDA/
 ├── Perception.py             #  Data analysis & planning module
 ├── Action.py                 #  Execution module 
 ├── Reflection.py             #  Quality control & iterative refinement
-├── Knowledge_Distillation.py             #  Knowledge Distillation
+├── Knowledge_Distillation.py #  Knowledge Distillation
 ├── Toolbox.py                # Unified toolbox (BiomedParse, SAM3, CLAHE, etc.)
 ├── Prompts.py                # Metaprompt registry for VLM interactions
 ├── BiomedParse_inference.py  # Standalone multi-GPU BiomedParse script
@@ -199,6 +199,7 @@ DatasetXXX_Name/
 The agent produces:
 
 - **Adaptation Plan**: JSON file with domain analysis and strategy
+- **Adapted Models** : nnUNet format adapted models
 - **Pseudo-labels**: Generated segmentation masks in nnUNet format
 - **Reflection Results**: Quality assessment for each case
 - **Logs**: Detailed execution logs
