@@ -94,10 +94,10 @@ export nnUNet_results="/path/to/nnUNet_results"
 
 Download the following checkpoints:
 
-| Model       | Huggingface Link                                             | Default Path        |
-| ----------- | ------------------------------------------------------------ | ------------------- |
-| BiomedParse | [Microsoft BiomedParse](https://huggingface.co/microsoft/BiomedParse) | `biomedparse_v1.pt` |
-| SAM3        | [SAM3 Repository](https://huggingface.co/facebook/sam3)      | `sam3.pt`           |
+| Model       | Huggingface Link                                             | Default Path     |
+| ----------- | ------------------------------------------------------------ | ---------------- |
+| BiomedParse | [Microsoft BiomedParse](https://huggingface.co/microsoft/BiomedParse) | `biomedparse.pt` |
+| SAM3        | [SAM3 Repository](https://huggingface.co/facebook/sam3)      | `sam3.pt`        |
 
 ## Usage
 
