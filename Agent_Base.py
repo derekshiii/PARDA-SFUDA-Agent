@@ -2,6 +2,8 @@ import os
 import sys
 import logging
 import json
+import shutil
+from pathlib import Path
 from datetime import datetime
 from openai import OpenAI
 from Perception import PerceptionModule
@@ -31,9 +33,13 @@ class MedicalSFUDAAgent:
         biomedparse_ckpt: str = "./BiomedParse/biomedparse_3D_AllData_MultiView_edge.ckpt",
         sam3_ckpt: str = "./sam3/sam3/sam3.pt",
         nnunet_env_path: str = None,
-        model: str = "qwen3-235b-a22b-instruct-2507",
-        gpus: list = [0, 1],
+        model: str = "Qwen3-VL-32B-Instruct",
+        gpus: list = None,
+        source_checkpoint: str = None,
     ):
+        gpus = [0] if gpus is None else list(gpus)
+        self.source_checkpoint = source_checkpoint
+        self.max_refinement_iterations = 5
         # 1. Setup Directories
         self.result_dir = result_dir
         self.log_dir = os.path.join(result_dir, "logs")
@@ -57,12 +63,14 @@ class MedicalSFUDAAgent:
         )
 
         self.finetuning = FinetuningModule(
-            self.logger, result_dir, target_env_path=nnunet_env_path
+            self.logger, result_dir, target_env_path=nnunet_env_path, gpus=gpus
         )
         self.reflection = ReflectionModule(self.client, result_dir, model, self.logger)
 
         # 5. Config
         self.target_organs = [t.strip() for t in target_organs.split(",")]
+        if any(not organ for organ in self.target_organs):
+            raise ValueError("Target organ names must be non-empty")
         self.target_data_path = target_data_path
 
     def _setup_logger(self):
@@ -86,203 +94,67 @@ class MedicalSFUDAAgent:
 
         return logger
 
-    def run(
-        self,
-        run_inference: bool = True,
-        run_Knowledge_Distillation: bool = True,
-        run_reflection: bool = True,
-    ):
-        """
-        Execute the Agentic Workflow.
-        """
-        self.logger.info("=" * 50)
-        self.logger.info("Starting Medical SFUDA Agent")
-        self.logger.info(f"Target Organs: {self.target_organs}")
-        self.logger.info(f"Data Path: {self.target_data_path}")
-        self.logger.info("=" * 50)
+    def run(self, run_inference=True, run_Knowledge_Distillation=True, run_reflection=True):
+        if run_Knowledge_Distillation and not run_reflection:
+            raise ValueError("Paper distillation requires Reflection-curated ACCEPT samples")
+        if run_Knowledge_Distillation and (not self.source_checkpoint or not Path(self.source_checkpoint).is_file()):
+            raise ValueError("Distillation requires an existing source_checkpoint trained for 500 epochs")
+        if not run_inference:
+            raise ValueError("Use FinetuningModule for distillation of an existing curated dataset")
+        samples, data_info = self.perception.scan_and_sample(self.target_data_path)
+        context = self.perception.analyze_domain(self.target_organs, samples)
+        self.perception.construct_prompts(context.get("corrected_targets", self.target_organs), context)
+        json_path = self.perception.save_adaptation_plan(context, data_info)
+        with open(json_path) as stream:
+            plan = json.load(stream)
+        dataset = self.action.execute_adaptation_plan(self.target_data_path, plan)
+        plan.update(source_checkpoint=self.source_checkpoint, refinement_budget=self.max_refinement_iterations,
+                    vlm_model=self.perception.model, constructed_dataset_path=dataset)
+        with open(json_path, "w") as stream:
+            json.dump(plan, stream, indent=2)
+        if run_reflection:
+            self.reflection.reflect_on_dataset(dataset, json_path, num_slices_per_case=4)
+            self._run_refinement(json_path, dataset)
+        if run_Knowledge_Distillation:
+            info = json.loads((Path(dataset) / "dataset.json").read_text())
+            if not info["numTraining"]:
+                raise ValueError("No ACCEPT samples remain for distillation")
+            dataset_id = self.finetuning.extract_dataset_id(dataset)
+            configuration = self.finetuning.run_preprocessing(dataset_id, self.source_checkpoint)
+            self.finetuning.run_training(dataset_id, configuration, checkpoint_path=self.source_checkpoint)
+        self.logger.info(f"Workflow finished: {dataset}")
+        return dataset
 
-        json_path = None
-        constructed_dataset_path = None
-
-        # --- Phase 1 & 2: Perception & Planning ---
-        self.logger.info("\n>>> Phase 1 & 2: Perception & Planning")
+    def _run_refinement(self, json_path, dataset):
+        attempts = {}
+        completed = False
         try:
-            samples, data_info = self.perception.scan_and_sample(self.target_data_path)
-            domain_context = self.perception.analyze_domain(self.target_organs, samples)
-
-            # Construct prompts
-            self.perception.construct_prompts(
-                domain_context.get("corrected_targets", self.target_organs),
-                domain_context,
-            )
-
-            # Save simplified plan (no execution_strategy hardcoded)
-            json_path = self.perception.save_adaptation_plan(domain_context, data_info)
-
-            # Load plan for later use
-            with open(json_path, "r") as f:
-                adaptation_plan = json.load(f)
-
-            self.logger.info(f"Plan generated: {json_path}")
-
-        except Exception as e:
-            self.logger.error(f"Perception phase failed: {e}")
-            return
-
-        # --- Phase 3 & 4: Action (Execution) ---
-        if run_inference:
-            self.logger.info("\n>>> Phase 3 & 4: Action (Execution)")
-            try:
-                constructed_dataset_path = self.action.execute_adaptation_plan(
-                    dataset_path=self.target_data_path,
-                    adaptation_plan=adaptation_plan,
-                    primary_tool=None,
-                )
-
-                self.logger.info(
-                    f"Action completed. Dataset ready at: {constructed_dataset_path}"
-                )
-
-            except Exception as e:
-                self.logger.error(f"Action phase failed: {e}")
-                import traceback
-
-                self.logger.error(traceback.format_exc())
-                return
-
-        # --- Phase 4.5: Reflection ---
-        if run_inference and run_reflection and constructed_dataset_path:
-            self.logger.info("\n>>> Phase 4.5: Reflection & Quality Control")
-            try:
-                reflection_summary = self.reflection.reflect_on_dataset(
-                    constructed_dataset_path=constructed_dataset_path,
-                    adaptation_plan_path=json_path,
-                    num_slices_per_case=4,
-                )
-                # Check for high rejection
-                if reflection_summary["rejection_rate"] > 0.4:
-                    self.logger.warning(
-                        f"High rejection rate ({reflection_summary['rejection_rate']:.1%}). Knowledge distillation might be unstable."
-                    )
-
-            except Exception as e:
-                self.logger.error(f"Reflection phase failed: {e}")
-
-        if run_inference and run_reflection and constructed_dataset_path:
-            self.logger.info("\n>>> Phase 4.6: Iterative Refinement Loop")
-
-            max_refinement_iterations = 3
-            refinement_iteration = 0
-
-            while refinement_iteration < max_refinement_iterations:
-                with open(json_path, "r") as f:
-                    current_plan = json.load(f)
-
-                refinement_strategy = current_plan.get("current_refinement_plan", {})
-                stop_refinement = refinement_strategy.get("stop_refinement", True)
-
-                if stop_refinement:
-                    self.logger.info(
-                        f"Refinement stopping condition met: {refinement_strategy.get('reason', 'Quality threshold reached')}"
-                    )
-
-                    self._finalize_reflection_after_refinement(
-                        json_path, constructed_dataset_path
-                    )
+            for iteration in range(1, self.max_refinement_iterations + 1):
+                with open(json_path) as stream:
+                    plan = json.load(stream)
+                reflection = plan["reflection"]
+                summary = self.reflection._summarize_evaluations(reflection.get("detailed_evaluations", []))
+                reflection.update(summary)
+                pending = [case for case in summary["rejected_cases"]
+                           if attempts.get(case, 0) < self.max_refinement_iterations]
+                if not pending:
                     break
-
-                refinement_iteration += 1
-                self.logger.info(
-                    f"\n=== Refinement Iteration {refinement_iteration}/{max_refinement_iterations} ==="
-                )
-
-                # Execute refinement
-                try:
-                    self.action.execute_refinement_actions(
-                        constructed_dataset_path=constructed_dataset_path,
-                        refinement_strategy=refinement_strategy,
-                        adaptation_plan=current_plan,
-                    )
-                except Exception as e:
-                    self.logger.error(f"Refinement execution failed: {e}")
-                    import traceback
-
-                    self.logger.error(traceback.format_exc())
-                    break
-
-                # Re-reflection with iteration number
-                try:
-                    affected_cases = self._get_affected_cases(refinement_strategy)
-
-                    if affected_cases:
-                        self.logger.info(
-                            f"Re-reflecting {len(affected_cases)} refined cases..."
-                        )
-
-                        re_reflection_summary = self.reflection.reflect_specific_cases(
-                            constructed_dataset_path=constructed_dataset_path,
-                            case_names=affected_cases,
-                            target_organs=current_plan.get("target_organs", []),
-                            organ_label_mapping=self._get_organ_label_mapping(
-                                constructed_dataset_path
-                            ),
-                            iteration=refinement_iteration,
-                        )
-
-                        self.reflection.merge_reflection_results(
-                            adaptation_plan_path=json_path,
-                            new_results=re_reflection_summary,
-                        )
-
-                except Exception as e:
-                    self.logger.error(f"Re-reflection failed: {e}")
-                    import traceback
-
-                    self.logger.error(traceback.format_exc())
-                    break
-
-            if refinement_iteration >= max_refinement_iterations:
-                self.logger.warning(
-                    "Reached maximum refinement iterations without convergence."
-                )
-                self._finalize_reflection_after_refinement(
-                    json_path, constructed_dataset_path
-                )
-
-        # --- Phase 5: Knowledge_Distillation ---
-        if run_inference and run_Knowledge_Distillation and constructed_dataset_path:
-            self.logger.info("\n>>> Phase 5: Knowledge_Distillation")
-            try:
-                dataset_id = self.finetuning.extract_dataset_id(
-                    constructed_dataset_path
-                )
-
-                # Auto-configure and Preprocess
-                auto_config = self.finetuning.run_preprocessing(dataset_id)
-
-                self.finetuning.run_training(
-                    dataset_id, auto_config, pretrained_weights=None
-                )
-
-            except Exception as e:
-                self.logger.error(f"Knowledge_Distillation phase failed: {e}")
-
-        self.logger.info("\n" + "=" * 50)
-        self.logger.info("Workflow Finished.")
-        self.logger.info("=" * 50)
-
-    def _get_affected_cases(self, refinement_strategy: Dict) -> List[str]:
-        """
-        Extract all affected case names from refinement strategy
-        """
-        affected = set()
-        actions = refinement_strategy.get("actions", {})
-
-        for tool_name, tool_config in actions.items():
-            cases = tool_config.get("cases", [])
-            affected.update(cases)
-
-        return list(affected)
+                subset = self.reflection._summarize_evaluations([
+                    ev for ev in summary["detailed_evaluations"] if ev["case_name"] in pending])
+                strategy = self.reflection.generate_refinement_plan(subset)
+                outcomes = self.action.execute_refinement_actions(dataset, strategy, plan)
+                for case in pending:
+                    attempts[case] = attempts.get(case, 0) + 1
+                    outcomes.setdefault(case, {"status": "failed", "error": "No valid VLM remedy available"})
+                results = self.reflection.reflect_specific_cases(dataset, pending,
+                    plan["target_organs"], self._get_organ_label_mapping(dataset), iteration=iteration)
+                results["tool_results"] = outcomes
+                results["attempts"] = dict(attempts)
+                self.reflection.merge_reflection_results(json_path, results)
+                self.logger.info(f"Refinement {iteration}/{self.max_refinement_iterations}: reassessed {len(pending)} rejected samples")
+            completed = True
+        finally:
+            self._finalize_reflection_after_refinement(json_path, dataset, attempts, refinement_completed=completed)
 
     def _get_organ_label_mapping(self, dataset_path: str) -> Dict[str, int]:
         """Read organ-label mapping from dataset.json"""
@@ -298,101 +170,74 @@ class MedicalSFUDAAgent:
 
         return organ_label_mapping
 
-    def _finalize_reflection_after_refinement(
-        self, json_path: str, constructed_dataset_path: str
-    ):
-        """
-        After refinement loop ends, update reflection with final state.
-        Clean up rejected cases and update dataset.json.
-        Add final status description.
-        """
-        self.logger.info("\n" + "=" * 60)
-        self.logger.info("FINALIZING REFLECTION RESULTS")
-        self.logger.info("=" * 60)
-
-        with open(json_path, "r") as f:
-            final_plan = json.load(f)
-
-        latest_reflection = final_plan.get("reflection", {})
-        final_rejected_cases = set(latest_reflection.get("rejected_cases", []))
-
-        images_dir = os.path.join(constructed_dataset_path, "imagesTr")
-        labels_dir = os.path.join(constructed_dataset_path, "labelsTr")
-
-        # Remove rejected cases
-        if final_rejected_cases:
-            self.logger.info(
-                f"Removing {len(final_rejected_cases)} rejected cases from dataset..."
-            )
-
-            self.reflection._remove_rejected_cases(
-                list(final_rejected_cases), images_dir, labels_dir
-            )
-
-            remaining_count = latest_reflection["total_evaluated"] - len(
-                final_rejected_cases
-            )
-            self.logger.info(
-                f"Removed {len(final_rejected_cases)} cases, {remaining_count} remaining"
-            )
+    def _finalize_reflection_after_refinement(self, json_path, constructed_dataset_path, attempts=None, refinement_completed=True):
+        dataset = Path(constructed_dataset_path)
+        with open(json_path) as stream:
+            plan = json.load(stream)
+        latest = plan.get("reflection", {})
+        latest.update(self.reflection._summarize_evaluations(latest.get("detailed_evaluations", [])))
+        latest.pop("uncertain", None)
+        latest.pop("uncertain_cases", None)
+        accepted = set(latest["accepted_cases"])
+        info = json.loads((dataset / "dataset.json").read_text())
+        ending = info["file_ending"]
+        retained, excluded, moves = [], [], []
+        archive = Path(self.result_dir) / "excluded_cases" / dataset.name
+        for image in sorted((dataset / "imagesTr").glob("*_0000" + ending)):
+            case = image.name[:-len("_0000" + ending)]
+            label = dataset / "labelsTr" / f"{case}{ending}"
+            if case in accepted and label.is_file():
+                retained.append(case)
+                continue
+            excluded.append(case)
+            for folder, path in (("imagesTr", image), ("labelsTr", label)):
+                if path.exists():
+                    destination = archive / folder / path.name
+                    if destination.exists():
+                        raise FileExistsError(f"Excluded sample already archived: {destination}")
+                    moves.append((path, destination))
+        # Check all archive collisions before moving either half of any image-label pair.
+        for path, destination in moves:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), destination)
+        self.reflection._update_dataset_json(constructed_dataset_path, len(retained))
+        latest["final_status"] = {"refinement_completed": refinement_completed, "budget": self.max_refinement_iterations,
+            "attempts": attempts or {}, "retained_cases": retained, "excluded_cases": excluded,
+            "final_dataset_size": len(retained), "archive": str(archive), "finalized_at": datetime.now().isoformat()}
+        plan["reflection"] = latest
+        if not refinement_completed:
+            reason = "Assessment interrupted; unresolved samples excluded"
+        elif not excluded:
+            reason = "All samples accepted"
+        elif all((attempts or {}).get(case, 0) >= self.max_refinement_iterations for case in excluded):
+            reason = "Refinement budget exhausted; rejected samples excluded"
         else:
-            remaining_count = latest_reflection.get("total_evaluated", 0)
-            self.logger.info(
-                f"No rejected cases to remove, {remaining_count} cases in dataset"
-            )
-
-        self.reflection._update_dataset_json(constructed_dataset_path, remaining_count)
-
-        with open(json_path, "r") as f:
-            final_plan = json.load(f)
-
-        refinement_strategy = final_plan.get("current_refinement_plan", {})
-
-        # Add final status description in reflection
-        if "reflection" in final_plan:
-            final_plan["reflection"]["final_status"] = {
-                "refinement_completed": True,
-                "stop_reason": refinement_strategy.get(
-                    "reason", "Refinement loop completed"
-                ),
-                "final_dataset_size": remaining_count,
-                "final_rejected_count": len(final_rejected_cases),
-                "finalized_at": datetime.now().isoformat(),
-            }
-
-            with open(json_path, "w") as f:
-                json.dump(final_plan, f, indent=2)
-
-        self.logger.info(
-            f"Final dataset: {remaining_count} cases (reflection finalized)"
-        )
-        self.logger.info(
-            f"Refinement reason: {refinement_strategy.get('reason', 'N/A')}"
-        )
-        self.logger.info("=" * 60 + "\n")
+            reason = "Refinement ended; unaccepted or unassessed samples excluded"
+        plan["current_refinement_plan"] = {"generated_at": datetime.now().isoformat(), "actions": {},
+                                           "failed_cases": [], "stop_refinement": True, "reason": reason}
+        with open(json_path, "w") as stream:
+            json.dump(plan, stream, indent=2)
+        self.logger.info(f"Curated dataset: {len(retained)} ACCEPT, {len(excluded)} excluded")
 
 
 if __name__ == "__main__":
-    # Config
-    API_KEY = ""
-    BASE_URL = ""
-    TARGET_DATA = ""
-    TARGETS = "Spleen,Right Kidney,Left Kidney,Gallbladder,Esophagus,Liver,Stomach,Aortic,Vena Cava,Pancreas,Right Adrenal,Left Adrenal,Duodenum,Bladder,Prostate/Uterus"
-
-    BP_CKPT = ""
-    SAM3_CKPT = ""
-
-    RESULT_DIR = "./Agent-Result"
-
-    agent = MedicalSFUDAAgent(
-        target_organs=TARGETS,
-        target_data_path=TARGET_DATA,
-        result_dir=RESULT_DIR,
-        api_key=API_KEY,
-        base_url=BASE_URL,
-        biomedparse_ckpt=BP_CKPT,
-        sam3_ckpt=SAM3_CKPT,
-        gpus=[0, 1],
-    )
-
-    agent.run(run_inference=True, run_reflection=True, run_Knowledge_Distillation=False)
+    import argparse
+    parser = argparse.ArgumentParser(description="PARDA paper adaptation pipeline")
+    parser.add_argument("--target-data", required=True)
+    parser.add_argument("--targets", required=True, help="Comma-separated organ names")
+    parser.add_argument("--source-checkpoint")
+    parser.add_argument("--base-url", default=os.environ.get("OPENAI_BASE_URL"))
+    parser.add_argument("--model", default="Qwen3-VL-32B-Instruct")
+    parser.add_argument("--biomedparse-checkpoint", required=True)
+    parser.add_argument("--sam3-checkpoint", required=True)
+    parser.add_argument("--nnunet-env")
+    parser.add_argument("--result-dir", default="./Agent-Result")
+    parser.add_argument("--gpus", default="0")
+    parser.add_argument("--skip-distillation", action="store_true")
+    args = parser.parse_args()
+    agent = MedicalSFUDAAgent(target_organs=args.targets, target_data_path=args.target_data,
+        result_dir=args.result_dir, api_key=os.environ.get("OPENAI_API_KEY"), base_url=args.base_url,
+        biomedparse_ckpt=args.biomedparse_checkpoint, sam3_ckpt=args.sam3_checkpoint,
+        nnunet_env_path=args.nnunet_env, model=args.model, gpus=[int(g) for g in args.gpus.split(",")],
+        source_checkpoint=args.source_checkpoint)
+    agent.run(run_Knowledge_Distillation=not args.skip_distillation)

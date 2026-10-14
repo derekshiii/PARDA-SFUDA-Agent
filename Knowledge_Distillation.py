@@ -3,12 +3,13 @@ import re
 import json
 import subprocess
 import glob
-from typing import Tuple, Optional, List
-import torch
+import sys
+from pathlib import Path
+from typing import Optional, List
 
 
 class FinetuningModule:
-    def __init__(self, logger, result_dir: str, target_env_path: Optional[str] = None):
+    def __init__(self, logger, result_dir: str, target_env_path: Optional[str] = None, gpus=None):
         """
         Args:
             logger: Logger instance
@@ -18,6 +19,9 @@ class FinetuningModule:
         self.logger = logger
         self.result_dir = result_dir
         self.target_env_path = target_env_path
+        self.gpus = [0] if gpus is None else list(gpus)
+        if not self.gpus:
+            raise ValueError("At least one GPU must be selected")
 
         self.PLANNER_NAME = "ResEncUNetPlanner"  # Corresponds to -pl in script
         self.FIXED_PLANS_IDENTIFIER = (
@@ -116,13 +120,31 @@ class FinetuningModule:
         else:
             raise ValueError(f"Could not extract Dataset ID from path: {dataset_path}")
 
-    def run_preprocessing(self, dataset_id: int) -> str:
+    def run_preprocessing(self, dataset_id: int, checkpoint_path=None) -> str:
         """
         Corresponds to Shell script: Step 1: Plan and preprocess fine-tuning dataset
         Command: nnUNetv2_plan_and_preprocess -d ID -c CONFIG -pl ResEncUNetPlanner
         """
         # 1. Auto-determine configuration (2d or 3d_fullres)
         auto_config = self._determine_config_from_dataset(dataset_id)
+        source_config = None
+        if checkpoint_path:
+            import torch
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            initialization = checkpoint["init_args"]
+            auto_config = initialization["configuration"]
+            if auto_config not in {"2d", "3d_fullres"}:
+                raise ValueError("Paper adaptation supports a 2d or 3d_fullres source model")
+            source_config = initialization["plans"]["configurations"][auto_config]
+            raw_dir = next(Path(os.environ["nnUNet_raw"]).glob(f"Dataset{dataset_id:03d}_*"))
+            target_info = json.loads((raw_dir / "dataset.json").read_text())
+            if len(initialization["dataset_json"]["channel_names"]) != len(target_info["channel_names"]):
+                raise ValueError("Source and target input channel counts must match")
+            source_ids = sorted(int(v) for v in initialization["dataset_json"]["labels"].values())
+            target_ids = sorted(int(v) for v in target_info["labels"].values())
+            if source_ids != target_ids:
+                raise ValueError("Full source initialization requires identical source/target class IDs; preserve source label order")
+            del checkpoint
 
         self.logger.info("-" * 50)
         self.logger.info(f"Starting Preprocessing (Shell Logic Step 1)")
@@ -131,10 +153,11 @@ class FinetuningModule:
         self.logger.info(f"Fixed Planner: {self.PLANNER_NAME}")
         self.logger.info("-" * 50)
 
-        cmd_executable = self._get_cmd_path("nnUNetv2_plan_and_preprocess")
+        python = self._get_cmd_path("python") if self.target_env_path else sys.executable
 
         cmd = [
-            cmd_executable,
+            python,
+            str(Path(__file__).with_name("nnunet_runtime.py")),
             "-d",
             str(dataset_id),
             "-c",
@@ -146,14 +169,21 @@ class FinetuningModule:
 
         self._execute_command(cmd, "Preprocessing")
 
+        if source_config is not None:
+            directory = next(Path(os.environ["nnUNet_preprocessed"]).glob(f"Dataset{dataset_id:03d}_*"))
+            path = directory / (self.FIXED_PLANS_IDENTIFIER + ".json")
+            plans = json.loads(path.read_text())
+            configuration = plans["configurations"][auto_config]
+            # Keep target normalization/spacing, but build exactly the source network and compatible patches.
+            for key in ("architecture", "patch_size", "batch_size"):
+                configuration[key] = source_config[key]
+            path.write_text(json.dumps(plans, indent=2))
+
         # Return configuration for training phase to use
         return auto_config
 
     def run_training(self, dataset_id: int, configuration: str, checkpoint_path: str):
-        """
-        Corresponds to Shell script: run_finetuning function
-        Command: nnUNetv2_train ID CONFIG all -pretrained_weights CKPT -p nnUNetResEncUNetPlans -num_gpus 2
-        """
+        """Distill ACCEPT pseudo-labels for 300 epochs from source-domain weights."""
         self.logger.info("-" * 50)
         self.logger.info(f"Starting Finetuning (Shell Logic: run_finetuning)")
         self.logger.info(f"Dataset ID: {dataset_id}")
@@ -163,18 +193,13 @@ class FinetuningModule:
         self.logger.info(f"Pretrained Weights: {checkpoint_path}")
         self.logger.info("-" * 50)
 
-        cmd_executable = self._get_cmd_path("nnUNetv2_train")
-
-        if torch.cuda.is_available():
-            gpu_count = torch.cuda.device_count()
-        else:
-            self.logger.warning(
-                "No CUDA devices found, defaulting to 1 GPU (or CPU if forced)."
-            )
-            gpu_count = 1
+        if not checkpoint_path or not Path(checkpoint_path).is_file():
+            raise ValueError("An existing source checkpoint is required")
+        python = self._get_cmd_path("python") if self.target_env_path else sys.executable
 
         cmd = [
-            cmd_executable,
+            python,
+            str(Path(__file__).with_name("train_student.py")),
             str(dataset_id),
             configuration,  # Passed from preprocessing or auto-determined
             self.FOLD,  # Fixed: all
@@ -183,9 +208,7 @@ class FinetuningModule:
             "-p",
             self.FIXED_PLANS_IDENTIFIER,  # Fixed: nnUNetResEncUNetPlans
             "-num_gpus",
-            str(
-                gpu_count
-            ),  # Keep original Python logic, use dual GPUs for acceleration
+            str(len(self.gpus)),
         ]
 
         self._execute_command(cmd, "Finetuning")
@@ -193,6 +216,7 @@ class FinetuningModule:
     def _execute_command(self, cmd: List[str], stage_name: str):
         self.logger.info(f"Executing: {' '.join(cmd)}")
         env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpus))
         try:
             process = subprocess.Popen(
                 cmd,

@@ -1,0 +1,68 @@
+# Python bytecode and caches (including nested packages)
+__pycache__/
+*.py[cod]
+
+# Local editor and lint settings
+.idea/
+.ruff_cache/
+.vscode/
+.pytest_cache/
+.cache/
+.venv/
+venv/
+
+# Internal documentation and verification artifacts
+/docs/
+/verification/
+
+# Local paper files and figures
+/Figures/
+/Paper/
+/CVPR2026.jpg
+/Detail_Illustration.png
+
+# Superseded documentation retained locally
+/Readme.md
+/readme.md
+
+# Standalone prototypes and local data maintenance experiments
+/Toolbox_Origin/
+/BiomedParse_inference.py
+/Clean_Dataset.py
+/Clean_label.py
+/test_toolbox_new_features.py
+
+# Local credentials and machine configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+credentials*.json
+secrets/
+
+# Generated runs, datasets, and model weights
+/Agent-Result/
+/nnUNet_raw/
+/nnUNet_preprocessed/
+/nnUNet_results/
+/test_zoom_sam3_temp/
+/ZOOM_ROI_Output/
+/BiomedParse/
+/BiomedParsev2/
+/sam3/
+/checkpoints/
+*.log
+*.nii
+*.nii.gz
+*.dcm
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.onnx

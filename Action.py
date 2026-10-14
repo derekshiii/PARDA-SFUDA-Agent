@@ -1,21 +1,26 @@
 import os
+import sys
 import json
 import shutil
+import tempfile
+from PIL import Image
 import numpy as np
 import nibabel as nib
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
-from nnUNet2BiomedParse import convert_nnunet_to_biomedparse
+from nnUNet2BiomedParse import convert_nnunet_to_biomedparse, load_volume, save_volume
 from Toolbox import (
     BiomedParsePredictor,
+    BiomedParse2DPredictor,
     SAM3Wrapper,
     ZoomSAM3Refiner,
     TopologyCleaner,
     CLAHE,
+    SymmetryChecker,
 )
 from tqdm import tqdm
 
-SAM3_PYTHON_PATH = "/home/syl/miniconda3/envs/sam3/bin/python"
+SAM3_PYTHON_PATH = os.environ.get("SAM3_PYTHON", sys.executable)
 SAM3_SCRIPT_PATH = "run_sam3_standalone.py"
 
 
@@ -27,15 +32,18 @@ class ActionModule:
         biomedparse_checkpoint: str,
         sam3_checkpoint: str,
         temp_dir: Optional[str] = None,
-        gpus: List[int] = [0, 1],
+        gpus: List[int] = None,
     ):
         self.result_dir = result_dir
         self.logger = logger
-        self.gpus = gpus
+        self.gpus = [0] if gpus is None else list(gpus)
+        if not self.gpus:
+            raise ValueError("At least one GPU must be selected")
 
         if temp_dir is None:
             temp_dir = os.path.join(result_dir, "temp")
         self.temp_dir = temp_dir
+        self.temp_root = temp_dir
 
         self.biomed_input_dir = os.path.join(self.temp_dir, "biomedparse_input_npz")
         self.pseudolabel_dir = os.path.join(result_dir, "Pseudolabels_NIfTI")
@@ -44,8 +52,9 @@ class ActionModule:
         os.makedirs(self.pseudolabel_dir, exist_ok=True)
 
         self.bp_predictor = BiomedParsePredictor(
-            checkpoint_path=biomedparse_checkpoint, cuda_devices=[str(g) for g in gpus]
+            checkpoint_path=biomedparse_checkpoint, cuda_devices=[str(g) for g in self.gpus]
         )
+        self.bp_2d_predictor = BiomedParse2DPredictor()
 
         self.sam3_wrapper = SAM3Wrapper(
             python_path=SAM3_PYTHON_PATH,
@@ -61,6 +70,9 @@ class ActionModule:
         Execute actions according to the Adaptation Plan.
         If primary_tool is None, read from adaptation_plan
         """
+        original_dataset_path = dataset_path
+        self.temp_dir = tempfile.mkdtemp(prefix="execution_", dir=self.temp_root)
+        self.biomed_input_dir = os.path.join(self.temp_dir, "biomedparse_input_npz")
         target_organs = adaptation_plan.get("target_organs", [])
         modality = adaptation_plan.get("domain_context", {}).get("modality", "CT")
         prompts = adaptation_plan.get("text_prompts", {})
@@ -69,9 +81,7 @@ class ActionModule:
             raise ValueError("No text prompts found in adaptation plan!")
 
         # === Read tool selection from adaptation_plan ===
-        strategy_recs = adaptation_plan.get("domain_context", {}).get(
-            "strategy_recommendations", {}
-        )
+        strategy_recs = adaptation_plan.get("strategy_recommendations", {})
 
         if primary_tool is None:
             primary_tool = strategy_recs.get("primary_tool", "Dual-Expert")
@@ -93,17 +103,14 @@ class ActionModule:
         if use_clahe:
             dataset_path = self._apply_clahe_to_dataset(dataset_path, clahe_params)
 
+        adaptation_plan["working_dataset_path"] = os.path.abspath(dataset_path)
+        self.pseudolabel_dir = tempfile.mkdtemp(prefix="Pseudolabels_", dir=self.result_dir)
+        adaptation_plan["pseudolabel_dir"] = self.pseudolabel_dir
         final_pseudolabel_dir = None
 
         if primary_tool == "BiomedParse":
             self.logger.info(f"BiomedParse prompts: {prompts}")
-            npz_input_dir = self._prepare_data_for_biomedparse(dataset_path, prompts)
-            final_pseudolabel_dir = self.bp_predictor.predict(
-                data_path=npz_input_dir,
-                output_dir=self.pseudolabel_dir,
-                slice_batch_size=4,
-                nms_threshold=0.5,
-            )
+            final_pseudolabel_dir = self._predict_biomedparse(dataset_path, prompts, self.pseudolabel_dir)
 
         elif primary_tool == "Dual-Expert":
             final_pseudolabel_dir = self._execute_dual_expert(
@@ -137,7 +144,7 @@ class ActionModule:
         if final_pseudolabel_dir and os.path.exists(final_pseudolabel_dir):
             constructed_dataset_path = self._construct_nnunet_dataset(
                 pseudolabel_dir=final_pseudolabel_dir,
-                original_dataset_path=dataset_path,
+                original_dataset_path=original_dataset_path,
                 target_organs=target_organs,
                 modality=modality,
             )
@@ -173,16 +180,13 @@ class ActionModule:
 
         # === Step 1: BiomedParse Inference ===
         self.logger.info("\n>>> Step 1/4: Running BiomedParse Inference...")
-        bp_output_dir = os.path.join(self.temp_dir, "dual_expert", "biomedparse_output")
+        dual_dir = os.path.join(self.temp_dir, "dual_expert")
+        if os.path.exists(dual_dir):
+            shutil.rmtree(dual_dir)
+        bp_output_dir = os.path.join(dual_dir, "biomedparse_output")
         os.makedirs(bp_output_dir, exist_ok=True)
 
-        npz_input_dir = self._prepare_data_for_biomedparse(dataset_path, prompts)
-        self.bp_predictor.predict(
-            data_path=npz_input_dir,
-            output_dir=bp_output_dir,
-            slice_batch_size=4,
-            nms_threshold=0.5,
-        )
+        self._predict_biomedparse(dataset_path, prompts, bp_output_dir)
         self.logger.info(f"BiomedParse results saved to: {bp_output_dir}")
 
         # === Step 2: Generate SAM3 Text+Visual Prompts ===
@@ -276,7 +280,8 @@ class ActionModule:
         for label_file in label_files:
             case_name = label_file.replace(".nii.gz", "")
             label_path = os.path.join(bp_label_dir, label_file)
-            img_path = os.path.join(images_dir, f"{case_name}_0000.nii.gz")
+            candidates = [Path(images_dir) / f"{case_name}_0000{ext}" for ext in (".nii.gz", ".png")]
+            img_path = str(next((p for p in candidates if p.is_file()), candidates[0]))
 
             if not os.path.exists(img_path):
                 self.logger.warning(f"Image not found for {case_name}, skipping")
@@ -533,6 +538,14 @@ class ActionModule:
         return fused
 
     # === Keep original methods ===
+    def _predict_biomedparse(self, dataset_path, prompts, output_dir):
+        info = json.loads((Path(dataset_path) / "dataset.json").read_text())
+        if info["file_ending"] == ".png":
+            return self.bp_2d_predictor.predict(dataset_path, output_dir, prompts, self.gpus)
+        npz_input_dir = self._prepare_data_for_biomedparse(dataset_path, prompts)
+        return self.bp_predictor.predict(data_path=npz_input_dir, output_dir=output_dir,
+                                         slice_batch_size=4, nms_threshold=0.5)
+
     def _prepare_data_for_biomedparse(
         self, dataset_path: str, prompts: Dict[str, str]
     ) -> str:
@@ -556,195 +569,197 @@ class ActionModule:
         )
         return self.biomed_input_dir
 
-    def _generate_sam3_text_config(
-        self, dataset_path: str, target_organs: List[str]
-    ) -> Dict:
-        """Internal: Generate text-only mode Config for SAM3"""
-        config = {}
-        images_dir = os.path.join(dataset_path, "imagesTr")
-        img_files = sorted(
-            [f for f in os.listdir(images_dir) if f.endswith("_0000.nii.gz")]
-        )
+    def _generate_sam3_text_config(self, dataset_path, target_organs):
+        images = Path(dataset_path) / "imagesTr"
+        return {p.name.removesuffix(".nii.gz").removesuffix(".png").removesuffix("_0000"):
+                {"image": str(p), "prompts": [{"obj_id": i, "text": organ, "prompt_type": "text"}
+                                              for i, organ in enumerate(target_organs, 1)]}
+                for p in sorted(images.iterdir()) if p.name.endswith(("_0000.nii.gz", "_0000.png"))}
 
-        for img_file in img_files:
-            case_name = img_file.replace("_0000.nii.gz", "")
-            img_path = os.path.join(images_dir, img_file)
+    def _construct_nnunet_dataset(self, pseudolabel_dir, original_dataset_path, target_organs, modality):
+        original = Path(original_dataset_path)
+        source_dir = original / "imagesTr"
+        with (original / "dataset.json").open() as stream:
+            original_info = json.load(stream)
+        ending = original_info["file_ending"]
+        if ending not in {".nii.gz", ".png"}:
+            raise ValueError(f"Unsupported dataset file ending: {ending}")
+        if ending == ".nii.gz" and len(original_info.get("channel_names", {"0": modality})) != 1:
+            raise ValueError("Supply the single target modality as channel _0000")
+        images = sorted(source_dir.glob("*_0000" + ending))
+        if not images:
+            raise ValueError("No target training images")
+        root = Path(os.environ.get("nnUNet_raw", str(original.parent)))
+        root.mkdir(parents=True, exist_ok=True)
+        ids = {int(p.name[7:10]) for p in root.glob("Dataset[0-9][0-9][0-9]_*")}
+        dataset_id = next((i for i in range(1, 1000) if i not in ids), None)
+        if dataset_id is None:
+            raise ValueError("No free nnUNet dataset ID")
+        output = root / f"Dataset{dataset_id:03d}_{original.name.split('_', 1)[-1]}_PARDA"
+        (output / "imagesTr").mkdir(parents=True)
+        (output / "labelsTr").mkdir()
+        for image in images:
+            case = image.name[:-len("_0000" + ending)]
+            reference = load_volume(image)
+            mask = load_volume(Path(pseudolabel_dir) / f"{case}.nii.gz")
+            data = mask.get_fdata()
+            self._validate_mask(data, reference, len(target_organs))
+            if not np.allclose(mask.affine, reference.affine):
+                raise ValueError(f"Pseudo-label geometry differs for {case}")
+            save_volume(data.astype(np.uint16), reference, output / "labelsTr" / f"{case}{ending}")
+            shutil.copy2(image, output / "imagesTr" / image.name)
+        info = {"channel_names": original_info.get("channel_names", {"0": modality}),
+                "labels": {"background": 0, **{organ: i for i, organ in enumerate(target_organs, 1)}},
+                "numTraining": len(images), "file_ending": ending, "name": output.name}
+        (output / "dataset.json").write_text(json.dumps(info, indent=2))
+        return str(output)
 
-            case_prompts = []
-            for idx, organ_name in enumerate(target_organs, start=1):
-                case_prompts.append(
-                    {"obj_id": idx, "prompt_type": "text", "text": organ_name}
-                )
+    @staticmethod
+    def _validate_mask(data, reference, num_labels):
+        if data.shape != reference.shape or not np.isfinite(data).all():
+            raise ValueError("Invalid pseudo-label shape or non-finite values")
+        if not np.equal(data, np.rint(data)).all() or data.min() < 0 or data.max() > num_labels:
+            raise ValueError("Pseudo-label contains invalid class IDs")
 
-            config[case_name] = {"image": img_path, "prompts": case_prompts}
+    def _resegment_case(self, image_path, label_path, output_path, target_map, proposal=None,
+                        label_ids=None, margin=10):
+        reference = load_volume(label_path)
+        masks = reference.get_fdata().astype(np.uint16) if proposal is None else proposal
+        selected = set(target_map) if label_ids is None else set(label_ids)
+        prompts = []
+        for label_id in sorted(selected):
+            prompt = {"obj_id": label_id, "text": target_map[label_id], "prompt_type": "text"}
+            box = self._extract_bbox_and_key_slice(masks == label_id, masks.shape)
+            if box:
+                axis = int(np.argmin(masks.shape))
+                h, w = [masks.shape[i] for i in range(3) if i != axis]
+                x, y, bw, bh = box["box"]
+                x0, y0 = max(0, x - margin), max(0, y - margin)
+                prompt.update(box=[x0, y0, min(w, x + bw + margin) - x0,
+                                   min(h, y + bh + margin) - y0], key_slice=box["key_slice"])
+            prompts.append(prompt)
+        with tempfile.TemporaryDirectory(dir=self.temp_dir, prefix="resegment_") as work:
+            config = Path(work) / "config.json"
+            config.write_text(json.dumps({"case": {"image": str(image_path), "prompts": prompts}}))
+            self.sam3_wrapper.predict(str(config), work, gpus=self.gpus, checkpoint=self.sam3_checkpoint)
+            result = load_volume(Path(work) / "case.nii.gz")
+            data = result.get_fdata()
+            self._validate_mask(data, reference, max(target_map))
+            if not np.allclose(result.affine, load_volume(image_path).affine):
+                raise ValueError("SAM3 changed image geometry")
+            original = reference.get_fdata().astype(np.uint16)
+            writable = (original == 0) | np.isin(original, list(selected))
+            original[np.isin(original, list(selected))] = 0
+            replace = writable & np.isin(data, list(selected))
+            original[replace] = data[replace].astype(np.uint16)
+            save_volume(original, reference, output_path)
 
-        return config
-
-    def _construct_nnunet_dataset(
-        self,
-        pseudolabel_dir: str,
-        original_dataset_path: str,
-        target_organs: List[str],
-        modality: str,
-    ) -> str:
-        """Package generated pseudo-labels into nnUNet format"""
-        self.logger.info("Constructing nnUNet Dataset from pseudolabels...")
-
-        nnunet_raw_root = os.path.dirname(os.path.abspath(original_dataset_path))
-        original_dirname = os.path.basename(os.path.abspath(original_dataset_path))
-
-        import re
-
-        match = re.match(r"Dataset(\d+)_", original_dirname)
-        original_suffix = original_dirname.split("_", 1)[1] if match else "SFUDA_Data"
-
-        existing_ids = set()
-        if os.path.exists(nnunet_raw_root):
-            for d in os.listdir(nnunet_raw_root):
-                if d.startswith("Dataset"):
-                    try:
-                        existing_ids.add(int(d[7:10]))
-                    except:
-                        pass
-
-        next_id = 1
-        while next_id in existing_ids:
-            next_id += 1
-
-        new_dataset_name = f"Dataset{next_id:03d}_{original_suffix}_QWen3-235B"
-        output_dataset_dir = os.path.join(nnunet_raw_root, new_dataset_name)
-
-        imagesTr = os.path.join(output_dataset_dir, "imagesTr")
-        labelsTr = os.path.join(output_dataset_dir, "labelsTr")
-        os.makedirs(imagesTr, exist_ok=True)
-        os.makedirs(labelsTr, exist_ok=True)
-
-        label_files = [f for f in os.listdir(pseudolabel_dir) if f.endswith(".nii.gz")]
-
-        valid_source_dirs = [
-            os.path.join(original_dataset_path, "imagesTr"),
-            os.path.join(original_dataset_path, "imagesTs"),
-        ]
-        source_dir = next((d for d in valid_source_dirs if os.path.exists(d)), None)
-
-        if not source_dir:
-            raise FileNotFoundError("Original imagesTr not found.")
-
-        success_count = 0
-        for lbl in label_files:
-            shutil.copy2(
-                os.path.join(pseudolabel_dir, lbl), os.path.join(labelsTr, lbl)
-            )
-
-            img_name = lbl.replace(".nii.gz", "_0000.nii.gz")
-            src_img = os.path.join(source_dir, img_name)
-            if os.path.exists(src_img):
-                shutil.copy2(src_img, os.path.join(imagesTr, img_name))
-                success_count += 1
-
-        labels_json = {"background": 0}
-        for i, organ in enumerate(target_organs, 1):
-            labels_json[organ] = i
-
-        dataset_json = {
-            "channel_names": {"0": modality},
-            "labels": labels_json,
-            "numTraining": success_count,
-            "file_ending": ".nii.gz",
-            "name": new_dataset_name,
-        }
-
-        with open(os.path.join(output_dataset_dir, "dataset.json"), "w") as f:
-            json.dump(dataset_json, f, indent=4)
-
-        self.logger.info(
-            f"Dataset constructed at: {output_dataset_dir} (Size: {success_count})"
-        )
-        return output_dataset_dir
-
-    # Retain original refinement methods...
-    def execute_refinement_actions(
-        self,
-        constructed_dataset_path: str,
-        refinement_strategy: Dict,
-        adaptation_plan: Dict,
-    ) -> None:
-        """Execute Refinement Actions (keep original implementation)"""
-        pass  # Retain original code
-
-    def _apply_clahe_to_dataset(self, dataset_path: str, clahe_params: Dict) -> str:
-        """
-        Apply CLAHE preprocessing to the entire dataset
-
-        Args:
-            dataset_path: Path to the original dataset
-            clahe_params: CLAHE parameter dictionary
-
-        Returns:
-            Path to the processed dataset
-        """
-        self.logger.info("\n" + "=" * 60)
-        self.logger.info("CLAHE PREPROCESSING STAGE")
-        self.logger.info("=" * 60)
-
-        # Create temporary directory for CLAHE-processed data
-        enhanced_dataset_dir = os.path.join(self.temp_dir, "clahe_enhanced_dataset")
-        os.makedirs(enhanced_dataset_dir, exist_ok=True)
-
-        # Copy dataset structure
-        for subdir in ["imagesTr", "imagesTs", "labelsTr", "labelsTs"]:
-            src_dir = os.path.join(dataset_path, subdir)
-            if os.path.exists(src_dir):
-                dst_dir = os.path.join(enhanced_dataset_dir, subdir)
-                os.makedirs(dst_dir, exist_ok=True)
-
-        # Copy dataset.json (if exists)
-        dataset_json_src = os.path.join(dataset_path, "dataset.json")
-        if os.path.exists(dataset_json_src):
-            shutil.copy2(
-                dataset_json_src, os.path.join(enhanced_dataset_dir, "dataset.json")
-            )
-
-        # Initialize CLAHE tool
-        clahe_tool = CLAHE(logger=self.logger)
-
-        # Process all image files
-        for subdir in ["imagesTr", "imagesTs"]:
-            src_dir = os.path.join(dataset_path, subdir)
-            if not os.path.exists(src_dir):
+    def _refine_symmetry(self, image_path, label_path, output_path, target_map, pairs, margin):
+        reference = load_volume(label_path)
+        image = load_volume(image_path)
+        labels = reference.get_fdata().astype(np.uint16)
+        checker = SymmetryChecker(self.logger)
+        axes = checker._detect_axes(labels.shape, reference.affine)
+        flip_axis = axes["flip_axis"]
+        # shortcut: foreground extent estimates the body midline, use anatomical registration for off-center/oblique scans.
+        body = image.get_fdata() > np.percentile(image.get_fdata(), 10)
+        coordinates = np.where(body)[flip_axis]
+        if not coordinates.size:
+            raise ValueError("Cannot estimate body midline")
+        midline = (coordinates.min() + coordinates.max()) / 2
+        proposal = labels.copy()
+        from scipy.ndimage import affine_transform
+        matrix, offset = np.eye(3), np.zeros(3)
+        matrix[flip_axis, flip_axis] = -1
+        offset[flip_axis] = 2 * midline
+        candidates = []
+        for pair in pairs:
+            ids = list(pair.values())
+            if len(ids) != 2 or any(i not in target_map for i in ids):
+                raise ValueError("Invalid anatomical pair")
+            sizes = [np.count_nonzero(labels == i) for i in ids]
+            if max(sizes) == 0:
                 continue
+            metrics = checker._calculate_metrics(labels == ids[0], labels == ids[1], axes)
+            agreement = metrics["volume_ratio"] * metrics["symmetry_dice_3d"] if metrics["valid_pair"] else 0
+            candidates.append((agreement, ids, sizes))
+        if not candidates:
+            raise ValueError("No non-empty paired organ available for symmetry refinement")
+        _, ids, sizes = min(candidates, key=lambda item: item[0])
+        # Correct the least-consistent pair so other paired structures remain intact.
+        source, target = (ids[0], ids[1]) if sizes[0] >= sizes[1] else (ids[1], ids[0])
+        mirrored = affine_transform((labels == source).astype(np.uint8), matrix,
+                                    offset=offset, order=0, mode="constant") > 0
+        proposal[(mirrored & (labels == 0)) | (labels == target)] = target
+        self._resegment_case(image_path, label_path, output_path, target_map,
+                             proposal=proposal, label_ids=[target], margin=margin)
 
-            dst_dir = os.path.join(enhanced_dataset_dir, subdir)
-            image_files = [f for f in os.listdir(src_dir) if f.endswith(".nii.gz")]
-
-            self.logger.info(f"Processing {len(image_files)} images in {subdir}...")
-
-            for img_file in tqdm(image_files, desc=f"CLAHE-{subdir}"):
-                src_path = os.path.join(src_dir, img_file)
-                dst_path = os.path.join(dst_dir, img_file)
-
+    def execute_refinement_actions(self, constructed_dataset_path, refinement_strategy, adaptation_plan):
+        dataset = Path(constructed_dataset_path)
+        info = json.loads((dataset / "dataset.json").read_text())
+        ending = info["file_ending"]
+        target_map = {i: organ for organ, i in info["labels"].items() if organ != "background"}
+        strategy = adaptation_plan["strategy_recommendations"]
+        working = Path(adaptation_plan.get("working_dataset_path", constructed_dataset_path)) / "imagesTr"
+        outcomes = {}
+        seen = set()
+        for tool, action in refinement_strategy.get("actions", {}).items():
+            for case in action["cases"]:
+                if case in seen or Path(case).name != case:
+                    raise ValueError("Each valid case must have exactly one refinement action")
+                seen.add(case)
+                label = dataset / "labelsTr" / f"{case}{ending}"
+                image = working / f"{case}_0000{ending}"
+                if not image.is_file():
+                    image = dataset / "imagesTr" / f"{case}_0000{ending}"
+                params = action.get("params", {})
                 try:
-                    clahe_tool.run_clahe(src_path, dst_path, params=clahe_params)
-                except Exception as e:
-                    self.logger.error(f"CLAHE failed on {img_file}: {e}")
-                    # If processing fails, copy original file
-                    shutil.copy2(src_path, dst_path)
+                    with tempfile.TemporaryDirectory(dir=label.parent, prefix=".refine_") as work:
+                        result = Path(work) / ("refined" + ending)
+                        if tool == "ZoomSAM3":
+                            coarse = load_volume(label)
+                            if not np.any(coarse.get_fdata()):
+                                self._resegment_case(image, label, result, target_map, margin=params.get("margin", 10))
+                            else:
+                                coarse_path = Path(work) / "coarse.nii.gz"
+                                nib.save(coarse, coarse_path)
+                                refined_path = Path(work) / "refined.nii.gz"
+                                refiner = ZoomSAM3Refiner(SAM3_PYTHON_PATH, SAM3_SCRIPT_PATH,
+                                    self.sam3_checkpoint, temp_root=work, logger=self.logger)
+                                refiner.run(str(image), str(coarse_path), str(refined_path),
+                                    target_map, margin=params.get("margin", 10), gpus=self.gpus)
+                                save_volume(load_volume(refined_path).get_fdata().astype(np.uint16), coarse, result)
+                        elif tool == "CLAHE":
+                            enhanced = Path(work) / ("enhanced" + ending)
+                            CLAHE(self.logger).run_clahe(str(image), str(enhanced), params)
+                            self._resegment_case(enhanced, label, result, target_map, margin=10)
+                        elif tool == "TopologyCleaner":
+                            params = {**params, "multi_component_labels": strategy.get("multi_component_labels", {})}
+                            TopologyCleaner(self.logger).run_cleaning(str(label), str(result), params)
+                        elif tool == "SymmetryChecker":
+                            self._refine_symmetry(image, label, result, target_map, strategy.get("organ_pairs", []), params.get("margin", 10))
+                        else:
+                            raise ValueError(f"Unsupported refinement tool: {tool}")
+                        reference, refined = load_volume(label), load_volume(result)
+                        data = refined.get_fdata()
+                        self._validate_mask(data, reference, max(target_map))
+                        if not np.allclose(reference.affine, refined.affine):
+                            raise ValueError("Refinement changed label geometry")
+                        os.replace(result, label)
+                    outcomes[case] = {"tool": tool, "params": params, "status": "success"}
+                except Exception as exc:
+                    self.logger.exception(f"Refinement failed for {case} with {tool}")
+                    outcomes[case] = {"tool": tool, "params": params, "status": "failed", "error": str(exc)}
+        return outcomes
 
-        # Copy label files (labels are not processed)
-        for subdir in ["labelsTr", "labelsTs"]:
-            src_dir = os.path.join(dataset_path, subdir)
-            if not os.path.exists(src_dir):
-                continue
-
-            dst_dir = os.path.join(enhanced_dataset_dir, subdir)
-            label_files = [f for f in os.listdir(src_dir) if f.endswith(".nii.gz")]
-
-            for lbl_file in label_files:
-                shutil.copy2(
-                    os.path.join(src_dir, lbl_file), os.path.join(dst_dir, lbl_file)
-                )
-
-        self.logger.info(f"CLAHE preprocessing completed → {enhanced_dataset_dir}")
-        self.logger.info("=" * 60 + "\n")
-
-        return enhanced_dataset_dir
+    def _apply_clahe_to_dataset(self, dataset_path, clahe_params):
+        source = Path(dataset_path)
+        enhanced = Path(self.temp_dir) / "clahe_enhanced_dataset"
+        if enhanced.exists():
+            shutil.rmtree(enhanced)
+        (enhanced / "imagesTr").mkdir(parents=True)
+        shutil.copy2(source / "dataset.json", enhanced / "dataset.json")
+        for image in sorted((source / "imagesTr").iterdir()):
+            if image.name.endswith(("_0000.nii.gz", "_0000.png")):
+                CLAHE(self.logger).run_clahe(str(image), str(enhanced / "imagesTr" / image.name), clahe_params)
+        return str(enhanced)

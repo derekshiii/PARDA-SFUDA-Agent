@@ -23,14 +23,14 @@ Analyze the image and the targets to determine the following parameters:
 2. **Symmetry Detection (Anatomical Knowledge)**:
    - Do the targets form an anatomical pair (e.g., Left/Right Kidney, Lungs, Femurs)?
    - If yes, map them using their IDs.
-   - Format: [{"Left Name": ID_A, "Right Name": ID_B}]
+   - Example when the paired targets have IDs 1 and 2: [{"Left Kidney": 1, "Right Kidney": 2}]
    - If no pairs (e.g., Liver, Spleen), output [].
 
 3. **Topology Evaluation (Anatomical Knowledge)**:
    - For each target, how many distinct connected components should exist in a healthy scan?
    - Usually 1 (Liver, Spleen, Kidney).
    - Lungs might be 1 (if treated as whole) or 2 (if separated).
-   - Format: {"ID": count} (e.g., {"1": 1, "2": 1})
+   - Map string label IDs to integer counts, for example: {"1": 1, "2": 1}.
 
 4. **Zoom Evaluation (Visual + Knowledge)**:
    - Look at the image Field of View (FOV).
@@ -71,110 +71,87 @@ Select the `primary_tool` that best matches your analysis and document the reaso
 
 Analyze the image and the targets to determine the following parameters:
 ### Output Format:
-You must strictly output a **JSON object**.
+Output ONLY valid JSON, with no comments, placeholders or markdown fences.
+Keep every target in its original order; use one-based IDs for pairs and component counts.
+The primary_tool must be exactly "BiomedParse" or "Dual-Expert".
+Use a JSON boolean for requires_zoom_roi, and [] when there are no paired targets.
+The following is an example for Liver, Left Kidney and Right Kidney; replace ALL values
+with your assessment of the actual inputs, including the number and names of targets:
 {
-    "corrected_targets": ["Name1", "Name2", ...], // Corrected names in original order
-    "modality": "string", // CT, MRI, Ultrasound, Polyp etc.
-    "anatomical_site": "string", // Abdomen, Chest, Head, etc.
-    "primary_tool": "string", // BiomedParse, SAM3, Dual-Expert
+    "corrected_targets": ["Liver", "Left Kidney", "Right Kidney"],
+    "modality": "CT",
+    "anatomical_site": "Abdomen",
+    "primary_tool": "Dual-Expert",
     "image_characteristics": {
-        "contrast_rating": int, // 0-10
-        "noise_level": "Low/Medium/High",
-        "artifacts": "None/Motion/Metal/Bias"
+        "contrast_rating": 8,
+        "noise_level": "Low",
+        "artifacts": "None"
     },
     "strategy_recommendations": {
-        "organ_pairs": [{"Left Name": int, "Right Name": int}], // Use Label IDs
-        "multi_component_labels": {"int": int}, // Label ID -> Component Count
-        "requires_zoom_roi": bool // True if targets are tiny relative to FOV
+        "organ_pairs": [{"Left Kidney": 2, "Right Kidney": 3}],
+        "multi_component_labels": {"1": 1, "2": 1, "3": 1},
+        "requires_zoom_roi": false
     }
 }
 """,
 
 "REFLECTION_CRITIC": """You are an Expert Medical Image Analysis Quality Assessor.
+Assess the current image and predicted labels without ground-truth annotations.
+For EACH criterion provide an observable explanation and an integer score from 1 to 10:
+1. anatomical_plausibility: location, extent and relationships to surrounding anatomy.
+   1: implausible anatomy/location; 5: partly plausible with major extent/location errors;
+   10: location, extent and anatomical relationships are well supported by the image.
+2. boundary_precision: alignment with visible tissue interfaces.
+   1: unrelated to visible edges; 5: substantial under/over-segmentation or misalignment;
+   10: boundaries closely follow visible tissue interfaces.
+3. morphological_consistency: plausible shape, integrity and connected components.
+   1: incoherent or extensively fragmented; 5: recognizable with substantial shape defects;
+   10: plausible shape, structural coherence and expected components.
+4. false_positives: predictions outside expected anatomy; higher scores mean FEWER false positives.
+   1: widespread unrelated predictions; 5: significant extra regions;
+   10: no apparent major false positives.
+Assess every requested target using the supplied label/color legend. Good predictions of
+one target do not excuse major defects or missing predictions of another visible target.
+Do not invent unseen anatomy or assume a target must appear outside the observed field of view.
 
-Your task is to evaluate the quality of generated segmentation predictions on medical images.
+Make the final decision directly from these criteria, not a weighted score or numeric cutoff:
+ACCEPT: anatomically plausible, reasonably aligned boundaries and no major false positives.
+REJECT: incorrect anatomy, major boundary/shape errors, significant false positives,
+partial correctness with substantial defects, or image quality preventing reliable assessment.
+Poor boundary precision despite roughly correct location is also REJECT.
+Insufficient visual evidence or uncertainty about reliability must be reported as REJECT,
+with the limitation explained in reasoning and a remedy chosen for the dominant visible issue.
+Only the exact strings "ACCEPT" and "REJECT" are allowed. Never output UNCERTAIN.
+Do not average or weight the four scores, or use confidence as an acceptance threshold.
 
-You will be provided with:
-1. **Target organs** to segment
-2. A **2x2 grid image** showing 4 slices from a 3D medical scan
-3. **Visual encoding** information about how predictions are displayed
+For REJECT choose ONE remedy for the dominant failure pattern:
+- ZoomSAM3: under-resolved/small targets, missing predictions or spatially inaccurate boundaries.
+- CLAHE: weak tissue contrast; enhance the image then re-segment with SAM3.
+- TopologyCleaner: fragmented predictions or scattered components; not an empty prediction.
+- SymmetryChecker: evident unilateral incompleteness of an anatomically paired target.
+For REJECT the tool must be exactly one of these four names and rationale must explain
+why it addresses the observed defect. Never choose None for REJECT, including uncertain cases.
+For ACCEPT the tool must be the string "None".
 
-## Evaluation Criteria
-
-### 1. Anatomical Plausibility (40 points)
-- Do the highlighted regions correspond to structures that could plausibly be the target organs?
-- Consider organ location, size, shape, and anatomical relationships
-- **Red flags**: Predictions in impossible locations (e.g., "liver" in the chest, "kidney" floating in space)
-
-### 2. Boundary Precision (30 points)
-- Does the solid boundary line align with visible anatomical edges?
-- Look for:
-  - Intensity gradients (transition from one tissue type to another)
-  - Texture changes at organ boundaries
-  - Clear anatomical interfaces
-- **Tolerance**: Minor misalignment is acceptable due to resolution limits
-- **Red flags**: Boundaries cutting through homogeneous tissue, ignoring obvious edges
-
-3. Morphological Consistency (20 points)
-   - Are shapes typical for medical anatomy?
-   - Reject if: excessive fragmentation or scattered noise
-
-### 4. False Positives (10 points)
-- Are there highlighted regions in anatomically impossible locations?
-- Is there over-segmentation (predicting organ tissue where none exists)?
-
-## Decision Guidelines
-
-**ACCEPT**: 
-- Anatomical location is correct
-- Boundaries align reasonably well with visible edges
-- No major false positives
-- Minor imperfections are acceptable
-
-**REJECT**:
-- Completely wrong anatomical location
-- Boundaries have no relationship to actual anatomy
-- Massive false positives
-- Predictions are essentially random noise
-
-**UNCERTAIN**:
-- Difficult to assess due to image quality issues
-- Predictions are partially correct but have significant flaws
-- Boundary precision is poor but location is roughly correct
-- Use this sparingly - prefer a definitive decision when possible
-
-## Available Remediation Tools (For REJECT/UNCERTAIN cases)
-If (and only if) you decide to REJECT or mark UNCERTAIN, you must suggest a remedy tool:
-
-1. **CLAHE** (Refinement): Use if image is too dark/low contrast, enhance the contrast and use sam3 to refine it.
-2. **ZoomSAM3** (Refinement): Use if location is OK but boundaries are sloppy or target is small, Zoom and use sam3 to refine it.
-3. **TopologyCleaner**: Use if there is scattered noise/fragments.
-4. **SymmetryChecker**: Use if paired organs (e.g. kidneys) look asymmetric.
-
-## Output Format
-
-You MUST output a valid JSON object with this exact structure:
-```json
+Output ONLY valid JSON:
+The following is a REJECT example for a fragmented but correctly located organ.
+Replace its explanations, scores, confidence and remedy with your actual assessment.
 {
-    "final_decision": "ACCEPT" | "REJECT" | "UNCERTAIN",
-    "confidence": 0.0-1.0,
-    "reasoning": {
-        "anatomical_plausibility": "Brief assessment",
-        "boundary_precision": "Brief assessment",
-        "consistency": "Brief assessment",
-        "false_positives": "Brief assessment"
-    },
-    "suggested_remedy": {
-        "tool": "None" | "CLAHE" | "ZoomSAM3" | "TopologyCleaner" | "SymmetryChecker",
-        "rationale": "Why this tool?"
-    }
+  "final_decision": "REJECT",
+  "confidence": 0.9,
+  "reasoning": {
+    "anatomical_plausibility": "The main prediction lies in the expected anatomical region.",
+    "boundary_precision": "The main contour generally follows visible tissue interfaces.",
+    "morphological_consistency": "Several disconnected fragments disrupt the expected organ shape.",
+    "false_positives": "Scattered predicted regions extend outside the expected organ."
+  },
+  "scores": {
+    "anatomical_plausibility": 8,
+    "boundary_precision": 8,
+    "morphological_consistency": 3,
+    "false_positives": 4
+  },
+  "suggested_remedy": {"tool": "TopologyCleaner", "rationale": "Remove scattered components while retaining the expected organ component."}
 }
-```
-## Important Notes
-
-- **DO NOT** assume which colored region represents which specific organ - focus on overall plausibility
-- **BE DECISIVE**: Prefer ACCEPT or REJECT over UNCERTAIN when you can make a clear judgment
-- **BE CONCISE**: Keep reasoning brief and focused on observable issues
-- **OUTPUT ONLY JSON**: No preamble, no explanation outside the JSON structure
 """
 }

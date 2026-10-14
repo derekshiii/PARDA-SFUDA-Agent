@@ -156,6 +156,8 @@ class PerceptionModule:
             Tuple of (visual_samples, data_info)
         """
         path_obj = Path(data_path)
+        if path_obj.is_dir() and (path_obj / "imagesTr").is_dir():
+            path_obj = path_obj / "imagesTr"
         supported_ext = {".nii", ".gz", ".png", ".jpg", ".jpeg"}
         all_files = []
 
@@ -168,8 +170,9 @@ class PerceptionModule:
         valid_files = [
             str(f)
             for f in all_files
-            if "".join(f.suffixes) in [".nii.gz", ".nii"]
-            or f.suffix in [".png", ".jpg", ".jpeg"]
+            if not {"labelsTr", "labelsTs"}.intersection(f.parts)
+            and ("".join(f.suffixes) in [".nii.gz", ".nii"]
+                 or f.suffix in [".png", ".jpg", ".jpeg"])
         ]
 
         if not valid_files:
@@ -321,6 +324,26 @@ Output strictly in JSON."""
             self.logger.debug(f"Cleaned JSON: {clean_json[:200]}...")
 
             analysis_result = json.loads(clean_json)
+            targets = analysis_result.get("corrected_targets")
+            if not isinstance(targets, list) or len(targets) != len(raw_target_organs) or any(
+                not isinstance(t, str) or not t.strip() for t in targets):
+                raise ValueError("Perception must preserve all target label IDs")
+            if len(set(targets)) != len(targets):
+                raise ValueError("Perception returned duplicate targets")
+            if analysis_result.get("primary_tool") not in {"BiomedParse", "Dual-Expert"}:
+                raise ValueError("Invalid paper pseudo-labeling strategy")
+            contrast = analysis_result.get("image_characteristics", {}).get("contrast_rating")
+            if type(contrast) is not int or not 0 <= contrast <= 10:
+                raise ValueError("Invalid 0-10 contrast rating")
+            strategy = analysis_result.get("strategy_recommendations", {})
+            for pair in strategy.get("organ_pairs", []):
+                ids = list(pair.values())
+                if len(ids) != 2 or len(set(ids)) != 2 or any(
+                        type(i) is not int or not 1 <= i <= len(targets) for i in ids):
+                    raise ValueError("Invalid paired-organ label IDs")
+            for label, count in strategy.get("multi_component_labels", {}).items():
+                if str(label) not in {str(i) for i in range(1, len(targets) + 1)} or type(count) is not int or count < 1:
+                    raise ValueError("Invalid expected component count")
 
             self.logger.info("VLM Analysis Successful.")
             self.logger.info(
@@ -332,45 +355,9 @@ Output strictly in JSON."""
 
             return analysis_result
 
-        except json.JSONDecodeError as e:
-            self.logger.error(f"JSON Decode Error: {e}")
-            self.logger.error(
-                f"Problematic text at position {e.pos}: {res_text[max(0, e.pos - 50) : e.pos + 50]}"
-            )
-            # Save raw response to file for debugging
-            error_file = os.path.join(
-                self.result_dir,
-                f"vlm_error_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-            )
-            with open(error_file, "w") as f:
-                f.write(res_text)
-            self.logger.error(f"Raw response saved to {error_file}")
-
-            # Return fallback
-            return {
-                "corrected_targets": raw_target_organs,
-                "modality": "Unknown",
-                "anatomical_site": "Unknown",
-                "image_characteristics": {"contrast_rating": 5},
-                "strategy_recommendations": {
-                    "organ_pairs": [],
-                    "multi_component_labels": {},
-                    "requires_zoom_roi": False,
-                },
-            }
-        except Exception as e:
-            self.logger.error(f"VLM Analysis Failed: {e}")
-            return {
-                "corrected_targets": raw_target_organs,
-                "modality": "Unknown",
-                "anatomical_site": "Unknown",
-                "image_characteristics": {"contrast_rating": 5},
-                "strategy_recommendations": {
-                    "organ_pairs": [],
-                    "multi_component_labels": {},
-                    "requires_zoom_roi": False,
-                },
-            }
+        except Exception as exc:
+            self.logger.exception("Perception failed; no adaptation strategy was inferred")
+            raise RuntimeError("Could not obtain a valid Perception plan") from exc
 
     def construct_prompts(
         self, corrected_target_organs: List[str], domain_context: Dict
@@ -425,6 +412,7 @@ Output strictly in JSON."""
             "text_prompts": self.generated_prompts,
             # Store recommendations that Action module can use
             "strategy_recommendations": {
+                "primary_tool": analysis_result.get("primary_tool", "Dual-Expert"),
                 "use_clahe": img_chars.get("contrast_rating", 5) < 4,
                 "clahe_params": {"clip_limit": 2.0},
                 "use_zoom_roi": strategy.get("requires_zoom_roi", False),

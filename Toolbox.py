@@ -1,4 +1,5 @@
 import os
+import logging
 import sys
 import json
 import time, cv2
@@ -9,25 +10,12 @@ from scipy.ndimage import label as nd_label
 from scipy import ndimage
 import torch
 import torch.nn.functional as F
-import hydra
-from hydra import compose
-from hydra.core.global_hydra import GlobalHydra
 from multiprocessing import Process, Queue
+from queue import Empty
 from tqdm import tqdm
 from typing import List, Dict, Any, Optional, Union, Literal, Tuple
-
-
-def _save_as_nii(mask_array, output_path: str, affine=None) -> None:
-    """Save mask array as NIfTI format."""
-    if torch.is_tensor(mask_array):
-        mask_array = mask_array.cpu().numpy()
-
-    if affine is None:
-        affine = np.eye(4)
-
-    mask_array = mask_array.astype(np.uint8)
-    nii_img = nib.Nifti1Image(mask_array, affine)
-    nib.save(nii_img, output_path)
+from PIL import Image
+from nnUNet2BiomedParse import load_volume, save_volume
 
 
 def _bp_worker_process(
@@ -49,11 +37,15 @@ def _bp_worker_process(
     device = torch.device("cuda:0")
 
     # --- FIX: Ensure utils can be imported ---
-    BIOMEDPARSE_ROOT = "/8TB_HDD_2/BiomedParsev2"
+    BIOMEDPARSE_ROOT = os.path.abspath(os.environ.get("BIOMEDPARSE3D_ROOT",
+        os.path.join(os.path.dirname(__file__), "BiomedParsev2")))
     if BIOMEDPARSE_ROOT not in sys.path:
         sys.path.insert(0, BIOMEDPARSE_ROOT)
 
     try:
+        import hydra
+        from hydra import compose
+        from hydra.core.global_hydra import GlobalHydra
         from utils import process_input, process_output, slice_nms
 
         # --- FIX: Use absolute config dir ---
@@ -147,7 +139,11 @@ def _bp_worker_process(
                 # Save NIfTI directly
                 base_name = os.path.splitext(filename)[0]
                 save_path = os.path.join(output_dir, f"{base_name}.nii.gz")
-                _save_as_nii(final_mask, save_path)
+                affine = data["affine"] if "affine" in data else np.eye(4)
+                header = nib.Nifti1Header(binaryblock=data["header"].tobytes()) if "header" in data else None
+                if header is not None:
+                    header.set_data_dtype(np.uint8)
+                nib.save(nib.Nifti1Image(np.asarray(final_mask, dtype=np.uint8), affine, header), save_path)
 
                 progress_queue.put({"status": "completed", "file": filename})
 
@@ -162,6 +158,20 @@ def _bp_worker_process(
         print(f"Worker {gpu_id} fatal error: {e}")
         print(traceback.format_exc())
         progress_queue.put({"status": "fatal", "error": str(e)})
+
+
+class BiomedParse2DPredictor:
+    def predict(self, dataset_path, output_dir, prompts, gpus):
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_biomedparse2d_standalone.py")
+        backend = os.path.abspath(os.environ.get("BIOMEDPARSE2D_ROOT",
+            os.path.join(os.path.dirname(__file__), "BiomedParse")))
+        python = os.environ.get("BIOMEDPARSE2D_PYTHON", sys.executable)
+        checkpoint = os.environ.get("BIOMEDPARSE2D_CHECKPOINT", os.path.join(backend, "biomedparse_v1.pt"))
+        subprocess.run([python, script,
+            "--dataset", str(dataset_path), "--output", str(output_dir),
+            "--prompts", json.dumps(prompts), "--gpu", str(gpus[0]),
+            "--checkpoint", checkpoint], check=True)
+        return output_dir
 
 
 class BiomedParsePredictor:
@@ -220,24 +230,29 @@ class BiomedParsePredictor:
             p.start()
             processes.append(p)
 
-        with tqdm(total=len(all_files)) as pbar:
-            finished = 0
-            while finished < len(all_files):
-                if not progress_queue.empty():
-                    msg = progress_queue.get()
-                    if msg["status"] == "completed":
+        failures = []
+        try:
+            with tqdm(total=len(all_files)) as pbar:
+                finished = 0
+                while finished < len(all_files):
+                    try:
+                        msg = progress_queue.get(timeout=0.2)
+                        if msg["status"] == "fatal":
+                            raise RuntimeError(f"BiomedParse model initialization failed: {msg.get('error')}")
                         finished += 1
                         pbar.update(1)
-                    elif msg["status"] == "error":
-                        finished += 1
-                        pbar.update(1)
-                        print(f"Error processing {msg.get('file')}: {msg.get('error')}")
-                    elif msg["status"] == "fatal":
-                        print(f"Fatal worker error: {msg.get('error')}")
-                time.sleep(0.1)
-
-        for p in processes:
-            p.join()
+                        if msg["status"] == "error":
+                            failures.append(msg)
+                    except Empty:
+                        if all(not p.is_alive() for p in processes):
+                            raise RuntimeError("BiomedParse workers exited before completing inference")
+            if failures:
+                raise RuntimeError(f"BiomedParse failed on {len(failures)} target images: {failures}")
+        finally:
+            for p in processes:
+                if p.is_alive():
+                    p.terminate()
+                p.join()
 
         print(f"BiomedParse Inference Completed. Results in {output_dir}")
         return output_dir
@@ -300,6 +315,7 @@ class SAM3Wrapper:
 
             config[case_key] = {
                 "image": img_path,
+                "slice_axis": metadata["axial_axis"],
                 "prompts": [
                     {
                         "obj_id": int(label_val),
@@ -395,19 +411,41 @@ class ZoomSAM3Refiner:
         try:
             # 2. ZoomROI Crop
             self.logger.info(">>> Step 1: Cropping ROIs...")
+            crop_source = image_path
+            rgb_image = None
+            if str(image_path).endswith(".png"):
+                with Image.open(image_path) as image:
+                    rgb_image = image.convert("RGB")
+                crop_source = os.path.join(session_dir, case_id + ".nii.gz")
+                nib.save(load_volume(image_path), crop_source)
             self.cropper.run_cropping(
-                image_path,
+                crop_source,
                 coarse_label_path,
                 crop_dir,
                 meta_path,
                 params={"margin": margin},
             )
+            with open(meta_path) as stream:
+                metadata = json.load(stream)
+            metadata["labels"] = [info for info in metadata["labels"] if info["label_value"] in target_map]
+            with open(meta_path, "w") as stream:
+                json.dump(metadata, stream)
 
             # 3. Generate SAM3 Config
             self.logger.info(">>> Step 2: Generating SAM3 Config...")
             sam3_config = self.sam3.generate_config_for_crops(
                 meta_path, crop_dir, target_map
             )
+            if rgb_image is not None:
+                for info in metadata["labels"]:
+                    if metadata["axial_axis"] != 2 or len(info["slices_info"]) != 1:
+                        raise ValueError("PNG refinement must contain one image plane")
+                    box = info["slices_info"][0]["bbox"]
+                    key = info["roi_file"].removesuffix(".nii.gz")
+                    color_path = os.path.join(crop_dir, key + ".png")
+                    rgb_image.crop((box["axis_1"]["min"], box["axis_0"]["min"],
+                                    box["axis_1"]["max"], box["axis_0"]["max"])).save(color_path)
+                    sam3_config[key]["image"] = color_path
 
             if not sam3_config:
                 self.logger.warning("No targets found to refine. Skipping.")
@@ -500,13 +538,21 @@ class CLAHE:
         grid_size = tuple(params.get("tile_grid_size", [8, 8]))
         bg_thresh = params.get("bg_threshold", 0.0)
 
+        if str(input_path).endswith(".png"):
+            with Image.open(input_path) as image:
+                pixels = np.asarray(image.convert("RGB"))
+            lab = cv2.cvtColor(pixels, cv2.COLOR_RGB2LAB)
+            lab[..., 0] = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid_size).apply(lab[..., 0])
+            Image.fromarray(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)).save(output_path)
+            return output_path
+
         if self.logger:
             self.logger.info(
                 f"Running CLAHE on {os.path.basename(input_path)} | Params: {params}"
             )
 
         # Load NIfTI
-        nii = nib.load(input_path)
+        nii = load_volume(input_path)
         data = nii.get_fdata()
 
         # Auto-detect slice axis (axis with fewest slices)
@@ -538,8 +584,7 @@ class CLAHE:
                 enhanced_volume[:, :, i] = enhanced_slice
 
         # Save
-        new_nii = nib.Nifti1Image(enhanced_volume, nii.affine, nii.header)
-        nib.save(new_nii, output_path)
+        save_volume(enhanced_volume, nii, output_path)
 
         if self.logger:
             self.logger.info(f"CLAHE completed → {os.path.basename(output_path)}")
@@ -716,7 +761,7 @@ class TopologyCleaner:
             )
 
         # Load NIfTI
-        nii = nib.load(input_path)
+        nii = load_volume(input_path)
         data = nii.get_fdata().astype(np.int16)
         cleaned_data = np.zeros_like(data)
 
@@ -760,8 +805,7 @@ class TopologyCleaner:
                 )
 
         # Save
-        new_nii = nib.Nifti1Image(cleaned_data, nii.affine, nii.header)
-        nib.save(new_nii, output_path)
+        save_volume(cleaned_data, nii, output_path)
 
         if self.logger:
             self.logger.info(f"Cleaning completed → {os.path.basename(output_path)}")
@@ -778,11 +822,13 @@ class SymmetryChecker:
     def __init__(self, logger=None):
         self.logger = logger
 
-    def _detect_axes(self, shape: Tuple[int, ...]) -> Dict[str, int]:
+    def _detect_axes(self, shape: Tuple[int, ...], affine=None) -> Dict[str, int]:
         """Auto-detect axes: Z-axis (fewest slices), Flip-axis (usually the first remaining)"""
         z_axis = int(np.argmin(shape))
         remaining = [i for i in range(3) if i != z_axis]
         flip_axis = remaining[0]
+        if affine is not None:
+            flip_axis = next(i for i, code in enumerate(nib.aff2axcodes(affine)) if code in {"L", "R"})
         return {"z_axis": z_axis, "flip_axis": flip_axis}
 
     def _calculate_metrics(
@@ -1009,6 +1055,7 @@ class ZoomROITool:
             "case_id": case_id,
             "original_shape": list(img_data.shape),
             "original_affine": img_nii.affine.tolist(),
+            "original_label_path": os.path.abspath(label_path),
             "axial_axis": int(axial_axis),
             "labels": [],
         }
@@ -1038,7 +1085,8 @@ class ZoomROITool:
         with open(meta_path, "r") as f:
             metadata = json.load(f)
 
-        final_label = np.zeros(metadata["original_shape"], dtype=np.int32)
+        original = nib.load(metadata["original_label_path"])
+        final_label = original.get_fdata().astype(np.int32)
         axial_axis = metadata["axial_axis"]
 
         sorted_labels = sorted(metadata["labels"], key=lambda x: x["label_value"])
@@ -1050,7 +1098,7 @@ class ZoomROITool:
             if not os.path.exists(roi_path):
                 if self.logger:
                     self.logger.warning(f"Refined ROI not found: {roi_path}")
-                continue
+                raise FileNotFoundError(f"Missing refined ROI: {roi_path}")
 
             refined_data = nib.load(roi_path).get_fdata().astype(np.int32)
             other_axes = [i for i in range(3) if i != axial_axis]
@@ -1073,28 +1121,18 @@ class ZoomROITool:
                 bbox_0 = slice_info["bbox"][f"axis_{other_axes[0]}"]
                 bbox_1 = slice_info["bbox"][f"axis_{other_axes[1]}"]
 
-                if axial_axis == 0:
-                    final_label[
-                        orig_idx,
-                        bbox_0["min"] : bbox_0["max"],
-                        bbox_1["min"] : bbox_1["max"],
-                    ][refined_mask] = label_val
-                elif axial_axis == 1:
-                    final_label[
-                        bbox_0["min"] : bbox_0["max"],
-                        orig_idx,
-                        bbox_1["min"] : bbox_1["max"],
-                    ][refined_mask] = label_val
-                else:
-                    final_label[
-                        bbox_0["min"] : bbox_0["max"],
-                        bbox_1["min"] : bbox_1["max"],
-                        orig_idx,
-                    ][refined_mask] = label_val
+                selection = [slice(None)] * 3
+                selection[axial_axis] = orig_idx
+                selection[other_axes[0]] = slice(bbox_0["min"], bbox_0["max"])
+                selection[other_axes[1]] = slice(bbox_1["min"], bbox_1["max"])
+                region = final_label[tuple(selection)]
+                writable = (region == 0) | (region == label_val)
+                region[region == label_val] = 0
+                region[refined_mask & writable] = label_val
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         nib.save(
-            nib.Nifti1Image(final_label, np.array(metadata["original_affine"])),
+            nib.Nifti1Image(final_label, original.affine, original.header),
             output_path,
         )
         return output_path

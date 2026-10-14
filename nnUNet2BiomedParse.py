@@ -8,6 +8,37 @@ import functools
 from PIL import Image
 
 
+def load_volume(file_path):
+    """Load spatial volumes, or a grayscale PNG as a single-slice volume."""
+    file_path = Path(file_path)
+    if file_path.suffix.lower() == ".png":
+        # shortcut: the 3D BiomedParse backend takes grayscale, use an RGB backend for color-dependent tasks.
+        with Image.open(file_path) as image:
+            data = np.asarray(image.convert("L"))[..., None]
+        return nib.Nifti1Image(data, np.eye(4))
+    nii = nib.load(file_path)
+    if len(nii.shape) == 2:
+        return nib.Nifti1Image(nii.get_fdata()[..., None], nii.affine)
+    if len(nii.shape) != 3:
+        raise ValueError(f"Expected a 2D/3D image: {file_path}")
+    return nii
+
+
+def save_volume(data, reference, output_path):
+    """Save in the reference image's geometry and requested file format."""
+    data = np.asarray(data)
+    if str(output_path).endswith(".png"):
+        if data.ndim == 3 and data.shape[-1] == 1:
+            data = data[..., 0]
+        if data.ndim != 2 or data.min() < 0 or data.max() > 255:
+            raise ValueError("PNG labels must be a 2D array with values 0-255")
+        Image.fromarray(data.astype(np.uint8)).save(output_path)
+    else:
+        header = reference.header.copy()
+        header.set_data_dtype(data.dtype)
+        nib.save(nib.Nifti1Image(data, reference.affine, header), output_path)
+
+
 def load_nii_gz(file_path):
     """
     Load .nii.gz file and return numpy array
@@ -106,38 +137,21 @@ def process_single_file(args):
     # Get base filename
     base_name = get_base_name(img_file)
 
-    # Find corresponding label file
-    label_file = find_matching_label_file(img_file, labels_dir)
-
-    if label_file is None or not label_file.exists():
-        return f"Warning: Label file not found for {img_file.name}", False
-
     try:
-        # Load image and label data
-        img_data = load_image_file(img_file)
-        label_data = load_image_file(label_file)
-
-        if img_data is None or label_data is None:
-            return f"Skipping {base_name} due to loading error", False
-
-        # Ensure dimensions match
-        if img_data.shape != label_data.shape:
-            return (
-                f"Skipping {base_name}: shape mismatch (img: {img_data.shape}, label: {label_data.shape})",
-                False,
-            )
-
-        # Ensure consistent data type
+        nii = load_volume(img_file)
+        img_data = nii.get_fdata()
+        if not np.isfinite(img_data).all():
+            raise ValueError("Image contains non-finite intensities")
+        if img_data.min() < 0 or img_data.max() > 255 or 0 < img_data.max() <= 1:
+            low, high = np.percentile(img_data, [0.5, 99.5])
+            img_data = np.clip((img_data - low) / max(high - low, 1e-6), 0, 1) * 255
         img_data = img_data.astype(np.uint8)
-        label_data = label_data.astype(np.uint8)
-
-        img_data = np.transpose(img_data, (0, 1, 2))
-        label_data = np.transpose(label_data, (0, 1, 2))
 
         output_data = {
             "imgs": img_data,
-            "gts": label_data,
             "text_prompts": text_prompts,
+            "affine": nii.affine,
+            "header": np.frombuffer(nii.header.binaryblock, dtype=np.uint8),
         }
 
         # Save as npz file
@@ -168,8 +182,6 @@ def convert_nnunet_to_biomedparse(
 
     if not images_dir.exists():
         raise ValueError(f"Images directory not found: {images_dir}")
-    if not labels_dir.exists():
-        raise ValueError(f"Labels directory not found: {labels_dir}")
 
     # Find all supported image file formats
     image_files = []
@@ -177,9 +189,9 @@ def convert_nnunet_to_biomedparse(
     image_files.extend(images_dir.glob("*_0000.png"))
 
     if not image_files:
-        print("No supported image files found in imagesTr directory")
-        print("Looking for files with pattern: *_0000.nii.gz or *_0000.png")
-        return
+        raise ValueError("No supported image files found in imagesTr")
+
+    num_processes = min(num_processes, len(image_files))
 
     print(f"Found {len(image_files)} image files")
     print(f"Using {num_processes} processes for conversion")
@@ -194,14 +206,12 @@ def convert_nnunet_to_biomedparse(
     ]
 
     processed_count = 0
-    with Pool(num_processes) as pool:
-        results = list(
-            tqdm(
-                pool.imap(process_single_file, process_args),
-                total=len(image_files),
-                desc="Converting files",
-            )
-        )
+    if num_processes == 1:
+        results = [process_single_file(args) for args in process_args]
+    else:
+        with Pool(num_processes) as pool:
+            results = list(tqdm(pool.imap(process_single_file, process_args),
+                                total=len(image_files), desc="Converting files"))
 
     for message, success in results:
         if success:
@@ -209,6 +219,9 @@ def convert_nnunet_to_biomedparse(
         # Print error messages for debugging
         if not success:
             print(message)
+
+    if processed_count != len(image_files):
+        raise RuntimeError(f"Conversion failed for {len(image_files) - processed_count} images")
 
     print(
         f"\nConversion completed! Processed {processed_count}/{len(image_files)} files."
@@ -245,26 +258,3 @@ def verify_conversion(npz_file_path):
 
     except Exception as e:
         print(f"Error verifying {npz_file_path}: {e}")
-
-
-# Text prompts: {'1': 'CT imaging of the spleen within the abdomen', '2': 'Presence of the right kidney detected in abdominal CT images'
-if __name__ == "__main__":
-    # Set parameters
-    input_directory = "/8TB_HDD_2/nnUNetFrame/nnUNet_raw/Dataset182_CVCDB"  # Directory containing imagesTr and labelsTr
-    output_directory = "/8TB_HDD_2/Datasets/CVCDB_processed"
-
-    # Set label prompt dictionary
-    text_prompts = {
-        "1": "colon polyp in colon endoscopes",
-        #'2': 'Myocardium in heart MR',
-        #'3': 'right ventricle', # This prompt can be kept even if we set it to zero in gts
-        "instance_label": 0,
-    }
-
-    # Execute conversion using all available cores
-    convert_nnunet_to_biomedparse(input_directory, output_directory, text_prompts)
-
-    # Verify first converted file
-    output_files = list(Path(output_directory).glob("*.npz"))
-    if output_files:
-        verify_conversion(output_files[0])
